@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environment & Secrets — NEVER commit these
+.env
+credentials.json
+service-account*.json
+*.key
+*.pem
+*_secret*
+*_private*
+*credentials*
+*secret*
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+*.log
+
+# Docker
+*.dockerignore
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+node_modules/
+*.tmp
+*.bak

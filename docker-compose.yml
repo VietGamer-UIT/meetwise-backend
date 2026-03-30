@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    container_name: meetwise-backend
+    ports:
+      - "8000:8000"       # local dev: http://localhost:8000
+    environment:
+      PORT: "8000"        # override Cloud Run default (8080) for local
+      USE_LLM: "${USE_LLM:-false}"
+      USE_FIREBASE: "${USE_FIREBASE:-false}"
+      USE_GOOGLE_SERVICES: "${USE_GOOGLE_SERVICES:-false}"
+      APP_ENV: "${APP_ENV:-development}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

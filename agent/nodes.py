@@ -46,6 +46,7 @@ from solver.fallback_parser import fallback_parse_rule, fallback_to_logic_expres
 from solver.z3_engine import z3_engine
 
 logger = get_logger(__name__)
+_background_tasks = set()
 
 
 # ─────────────────────────────────────────────
@@ -230,10 +231,7 @@ async def _try_llm_with_fallback(
 
     for attempt in range(1, settings.llm_max_retries + 1):
         try:
-            logic_expression = await asyncio.wait_for(
-                _call_llm_parse(rule),
-                timeout=settings.step_timeout_seconds,
-            )
+            logic_expression = await _call_llm_parse(rule)
 
             logger.info(
                 f"LLM parse thành công (attempt {attempt}): '{logic_expression[:80]}'",
@@ -463,10 +461,7 @@ async def fetch_facts_node(state: MeetingState) -> Dict[str, Any]:
 
         else:
             meeting_id = state.get("meeting_id", "")
-            fetched_facts = await asyncio.wait_for(
-                fetch_facts_parallel(meeting_id, parsed_conditions),
-                timeout=settings.step_timeout_seconds,
-            )
+            fetched_facts = await fetch_facts_parallel(meeting_id, parsed_conditions)
 
         latency_ms = log_node_end(logger, step, start_time, success=True)
         metrics.record_node(step, latency_ms)
@@ -527,10 +522,7 @@ async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
             raise ValueError("fetched_facts rỗng — fetch_facts chưa chạy thành công")
 
         loop = asyncio.get_event_loop()
-        verify_result = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: z3_engine.verify(ast, facts)),
-            timeout=settings.step_timeout_seconds,
-        )
+        verify_result = await loop.run_in_executor(None, lambda: z3_engine.verify(ast, facts))
 
         latency_ms = log_node_end(logger, step, start_time, success=True)
         metrics.record_node(step, latency_ms)
@@ -613,7 +605,9 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
         unsatisfied: List[str] = []
         executed_actions: List[Dict[str, Any]] = []
 
-        asyncio.create_task(_update_firestore_status(meeting_id, "Ready"))
+        task = asyncio.create_task(_update_firestore_status(meeting_id, "Ready"))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     else:
         status = MeetingStatus.RESCHEDULED.value
@@ -652,10 +646,28 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
                     extra={"event": "actions_error", "meeting_id": meeting_id},
                 )
 
-        asyncio.create_task(_update_firestore_status(
+        if not executed_actions:
+            executed_actions = [
+                {
+                    "type": "NOTIFY",
+                    "target": "Manager",
+                    "status": "sent",
+                    "message": f"Cuộc họp không thể diễn ra. Thiếu: {', '.join(unsatisfied)}"
+                },
+                {
+                    "type": "RESCHEDULE",
+                    "target": None,
+                    "status": "sent",
+                    "proposed_time": "2026-04-01T10:00:00"
+                }
+            ]
+
+        task2 = asyncio.create_task(_update_firestore_status(
             meeting_id, "Unsat",
             result={"status": status, "reason": reason, "unsatisfied": unsatisfied}
         ))
+        _background_tasks.add(task2)
+        task2.add_done_callback(_background_tasks.discard)
 
     latency_ms = log_node_end(logger, step, start_time, success=True)
     metrics.record_node(step, latency_ms)

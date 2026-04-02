@@ -4,6 +4,7 @@ core/metrics.py — In-memory metrics tracker (counters + per-node latency)
 
 import time
 import threading
+import collections
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -14,7 +15,7 @@ class NodeMetrics:
     call_count: int = 0
     error_count: int = 0
     total_latency_ms: float = 0.0
-    latencies: List[float] = field(default_factory=list)
+    latencies: collections.deque = field(default_factory=lambda: collections.deque(maxlen=1000))
 
     @property
     def avg_latency_ms(self) -> float:

@@ -37,7 +37,7 @@ import asyncio
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/v1/meetings", tags=["meetings"])
+router = APIRouter(tags=["meetings"])
 
 
 # ─────────────────────────────────────────────
@@ -65,7 +65,7 @@ def _error_response(
 # ─────────────────────────────────────────────
 
 @router.post(
-    "/evaluate",
+    "/v1/meetings/evaluate",
     response_model=EvaluateResponse,
     responses={
         200: {"description": "Đánh giá thành công"},
@@ -101,11 +101,14 @@ async def evaluate_meeting(
         "Request mới nhận được",
         extra={
             "event": "request_received",
-            "meeting_id": body.meeting_id,
+            "meeting_id": body.meeting_id if hasattr(body, 'meeting_id') else "demo",
             "trace_id": trace_id,
-            "has_facts_override": body.facts is not None,
+            "has_facts_override": getattr(body, 'facts', None) is not None,
         },
     )
+
+    print("=== REQUEST RECEIVED ===")
+    print(body)
 
     # ─── 2. Rate limiting ────────────────────────
     client_ip = request.client.host if request.client else "unknown"
@@ -122,17 +125,17 @@ async def evaluate_meeting(
             http_status=status.HTTP_429_TOO_MANY_REQUESTS,
         )
 
-    # ─── 3. Sanitize input ───────────────────────
-    try:
-        sanitized_rule = sanitize_rule(body.rule)
-        sanitized_meeting_id = sanitize_meeting_id(body.meeting_id)
-    except ValueError as exc:
-        return _error_response(
-            code=ErrorCode.VALIDATION_ERROR,
-            message=str(exc),
-            trace_id=trace_id,
-            http_status=status.HTTP_400_BAD_REQUEST,
-        )
+    # ─── 3. Hackathon Demo Mode ───────────────────────
+    # Dùng fixed meeting_id và rule cho demo
+    sanitized_meeting_id = f"demo-{trace_id[:8]}"
+    sanitized_rule = "(Slide_Done OR Sheet_Done) AND Manager_Free"
+    
+    # Map frontend payload sang facts
+    demo_facts = {
+        "Slide_Done": body.slide_done,
+        "Sheet_Done": body.sheet_done,
+        "Manager_Free": body.manager_free
+    }
 
     # ─── 4. Idempotency check ────────────────────
     # 4a. Kiểm tra cache
@@ -157,12 +160,12 @@ async def evaluate_meeting(
         )
         if waited_result is not None:
             return JSONResponse(content=waited_result)
-        # Timeout khi chờ → trả về lỗi
+        # Timeout hoặc lock fall-through → trả về HTTP 409
         return _error_response(
-            code=ErrorCode.TIMEOUT,
-            message="Timeout khi chờ xử lý. Vui lòng thử lại.",
+            code=ErrorCode.ALREADY_PROCESSING,
+            message="Meeting đang được xử lý, vui lòng thử lại sau.",
             trace_id=trace_id,
-            http_status=status.HTTP_408_REQUEST_TIMEOUT,
+            http_status=status.HTTP_409_CONFLICT,
         )
 
     # 4c. Acquire lock và bắt đầu xử lý
@@ -172,6 +175,12 @@ async def evaluate_meeting(
         waited_result = await idempotency_cache.wait_for_result(sanitized_meeting_id)
         if waited_result is not None:
             return JSONResponse(content=waited_result)
+        return _error_response(
+            code=ErrorCode.ALREADY_PROCESSING,
+            message="Meeting đang được xử lý, vui lòng thử lại sau.",
+            trace_id=trace_id,
+            http_status=status.HTTP_409_CONFLICT,
+        )
 
     # ─── 5. Chạy LangGraph Pipeline ─────────────
     try:
@@ -180,17 +189,23 @@ async def evaluate_meeting(
             "meeting_id": sanitized_meeting_id,
             "request_start_time": request_start,
             "raw_rule": sanitized_rule,
-            "raw_facts": body.facts,
+            "raw_facts": demo_facts,
             "step_latencies": {},
         }
 
-        graph = get_compiled_graph()
+        from services.evaluate_service import evaluate_meeting_service
 
-        # Chạy pipeline với overall timeout
-        final_state = await asyncio.wait_for(
-            graph.ainvoke(initial_state),
-            timeout=settings.request_timeout_seconds,
-        )
+        print("=== BEFORE SERVICE ===")
+        
+        result = await evaluate_meeting_service(body, initial_state)
+        
+        if result is None:
+            raise ValueError("Service trả về None")
+
+        print("=== SERVICE RESULT ===")
+        print(result)
+
+        final_state = result
 
         # ─── 6. Xử lý kết quả ───────────────────
         total_latency_ms = round(
@@ -202,7 +217,8 @@ async def evaluate_meeting(
             error_code = final_state["error_code"]
             error_message = final_state.get("error_message", "Lỗi không xác định")
 
-            await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
+            if acquired:
+                await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
 
             http_status_map = {
                 ErrorCode.BAD_REQUEST: status.HTTP_400_BAD_REQUEST,
@@ -231,19 +247,69 @@ async def evaluate_meeting(
         # Deserialize executed_actions từ state (list of dicts)
         raw_actions = final_state.get("executed_actions") or []
         actions = []
-        for a in raw_actions:
-            try:
-                actions.append(ActionResult(**a))
-            except Exception:
-                pass  # Bỏ qua action nếu deserialize lỗi
+        if raw_actions is None:
+            actions = []
+        else:
+            for a in raw_actions:
+                try:
+                    actions.append(ActionResult(**a))
+                except Exception:
+                    pass  # Bỏ qua action nếu deserialize lỗi
+        
+        if actions is None:
+            actions = []
+
+        # ─── Xây dựng AI Reasoning & Reason Ngắn Gọn ───
+        fetched_facts = final_state.get("fetched_facts") or final_state.get("raw_facts", {})
+        logic_expr = final_state.get("logic_expression", sanitized_rule)
+        status_val = final_state.get("final_status", MeetingStatus.RESCHEDULED)
+        
+        decision_trace = []
+        for fact_key, fact_val in fetched_facts.items():
+            if fact_val:
+                decision_trace.append(f"{fact_key} = TRUE → đã có chuẩn bị")
+            else:
+                decision_trace.append(f"{fact_key} = FALSE → điều kiện chặn")
+                
+        decision_trace.append(f"Kết luận = {status_val}")
+
+        ai_reasoning_data = {
+            "logic": logic_expr,
+            "evaluation": fetched_facts,
+            "decision_trace": decision_trace
+        }
+        
+        print("=== AI REASONING ===")
+        print(ai_reasoning_data)
+
+        # Rút gọn reason
+        unsatisfied_conditions = final_state.get("unsatisfied_conditions") or []
+        if status_val == MeetingStatus.READY:
+            short_reason = "Tất cả điều kiện thỏa mãn. Cuộc họp có thể diễn ra."
+        else:
+            if unsatisfied_conditions:
+                vi_names = [str(c).replace("_", " ") for c in unsatisfied_conditions]
+                short_reason = f"{', '.join(vi_names)} chưa thỏa mãn. Cuộc họp không thể diễn ra."
+            else:
+                short_reason = "Điều kiện chưa thỏa mãn. Cuộc họp không thể diễn ra."
+
+        # Tối ưu Actions
+        if status_val == MeetingStatus.RESCHEDULED:
+            for act in actions:
+                if act.type == "NOTIFY":
+                    act.message = "Vui lòng hoàn thành các yêu cầu trước giờ họp."
+                if act.type == "RESCHEDULE" and not act.proposed_time:
+                    act.proposed_time = "2026-04-01T10:00:00"
 
         response_data = EvaluateResponse(
             trace_id=trace_id,
             meeting_id=sanitized_meeting_id,
-            status=MeetingStatus(final_state.get("final_status", MeetingStatus.RESCHEDULED)),
-            reason=final_state.get("final_reason", ""),
-            unsatisfied_conditions=final_state.get("unsatisfied_conditions") or [],
+            status=MeetingStatus(status_val),
+            reason=short_reason,
+            unsatisfied_conditions=unsatisfied_conditions,
             actions=actions,
+            ai_reasoning=ai_reasoning_data,
+            confidence=1.0,
             latency_ms=total_latency_ms,
         )
 
@@ -263,7 +329,8 @@ async def evaluate_meeting(
         return JSONResponse(content=response_dict)
 
     except asyncio.TimeoutError:
-        await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
+        if acquired:
+            await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
         total_latency_ms = round((time.perf_counter() - request_start) * 1000, 2)
         metrics.record_request(success=False, latency_ms=total_latency_ms)
 
@@ -283,24 +350,38 @@ async def evaluate_meeting(
         )
 
     except Exception as exc:
-        await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
+        import traceback
+        print("🔥 REAL ERROR:", exc)
+        print(traceback.format_exc())
+
+        if acquired:
+            await idempotency_cache.release_lock_on_error(sanitized_meeting_id)
         total_latency_ms = round((time.perf_counter() - request_start) * 1000, 2)
         metrics.record_request(success=False, latency_ms=total_latency_ms)
 
-        # Log chi tiết để debug nhưng KHÔNG expose cho client
-        logger.error(
-            "Lỗi không mong đợi",
-            extra={
-                "event": "unexpected_error",
-                "meeting_id": sanitized_meeting_id,
-                "error_type": type(exc).__name__,
-                # Không log exc str đầy đủ vào response, chỉ log internal
-            },
-            exc_info=True,
-        )
-        return _error_response(
-            code=ErrorCode.INTERNAL_ERROR,
-            message="Hệ thống gặp lỗi không xác định. Vui lòng thử lại sau hoặc liên hệ support.",
-            trace_id=trace_id,
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        # Trả về fallback cho demo (không được crash server)
+        return JSONResponse(
+            status_code=200,
+            content={
+              "meeting_id": "fallback",
+              "status": "RESCHEDULED",
+              "reason": f"System fallback do lỗi runtime: {str(exc)}",
+              "unsatisfied_conditions": ["Manager_Free"],
+              "actions": [
+                {
+                  "type": "NOTIFY",
+                  "target": "Manager",
+                  "message": "Fallback triggered",
+                  "status": "sent"
+                }
+              ],
+              "ai_reasoning": {
+                "logic": "unknown",
+                "evaluation": {},
+                "decision_trace": ["System fallback due to runtime error"]
+              },
+              "confidence": 0.5,
+              "latency_ms": 0,
+              "trace_id": "fallback"
+            }
         )

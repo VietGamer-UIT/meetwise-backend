@@ -90,6 +90,26 @@ class ActionResult(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# AI REASONING MODELS
+# ─────────────────────────────────────────────
+
+class AIReasoning(BaseModel):
+    """Thông tin giải thích quyết định dựa trên Neuro-Symbolic AI & Z3 Solver."""
+    logic: str = Field(
+        ...,
+        description="Biểu thức logic hình thức (từ LLM/Z3)",
+    )
+    evaluation: Dict[str, bool] = Field(
+        ...,
+        description="Đánh giá giá trị thực tế của từng điều kiện",
+    )
+    decision_trace: List[str] = Field(
+        ...,
+        description="Diễn giải từng bước quá trình ra quyết định",
+    )
+
+
+# ─────────────────────────────────────────────
 # SUCCESS RESPONSE  ← FRONTEND CONTRACT (LOCKED)
 # ─────────────────────────────────────────────
 
@@ -141,6 +161,16 @@ class EvaluateResponse(BaseModel):
         examples=[45.2],
     )
 
+    ai_reasoning: AIReasoning = Field(
+        ...,
+        description="Giải thích quy trình suy luận từ hệ thống AI",
+    )
+
+    confidence: float = Field(
+        default=1.0,
+        description="Độ tự tin của quyết định (luôn là 1.0 vì dựa trên logic hình thức xác định)",
+    )
+
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -164,6 +194,20 @@ class EvaluateResponse(BaseModel):
                             "proposed_time": "2026-04-01T10:00:00",
                         },
                     ],
+                    "ai_reasoning": {
+                        "logic": "(Slide_Done OR Sheet_Done) AND Manager_Free",
+                        "evaluation": {
+                            "Slide_Done": False,
+                            "Sheet_Done": True,
+                            "Manager_Free": False
+                        },
+                        "decision_trace": [
+                            "Sheet_Done = TRUE → đã có chuẩn bị",
+                            "Manager_Free = FALSE → điều kiện chặn hạn chế",
+                            "Kết luận phân tích Z3 = RESCHEDULED"
+                        ]
+                    },
+                    "confidence": 1.0,
                     "latency_ms": 45.2,
                 }
             ]

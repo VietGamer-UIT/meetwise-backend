@@ -163,21 +163,22 @@ class AsyncIdempotencyCache:
             extra={"event": "lock_released_error", "meeting_id": meeting_id},
         )
 
-    def cleanup_expired(self) -> int:
+    async def cleanup_expired(self) -> int:
         """
         Đồng bộ dọn dẹp entries hết hạn (chạy trong background task nếu cần).
         Returns số entries đã xóa.
         """
-        now = time.monotonic()
-        expired_keys = [
-            k
-            for k, v in self._cache.items()
-            if now - v.cached_at > v.ttl
-        ]
-        for k in expired_keys:
-            del self._cache[k]
-            self._locks.pop(k, None)
-        return len(expired_keys)
+        async with self._meta_lock:
+            now = time.monotonic()
+            expired_keys = [
+                k
+                for k, v in self._cache.items()
+                if now - v.cached_at > v.ttl
+            ]
+            for k in expired_keys:
+                del self._cache[k]
+                self._locks.pop(k, None)
+            return len(expired_keys)
 
 
 # Singleton

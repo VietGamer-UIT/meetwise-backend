@@ -12,6 +12,13 @@ build/
 
 # Environment & Secrets — NEVER commit these
 .env
+.venv/
+__pycache__/
+*.log
+credentials.json
+service-account*.json
+*.key
+*.pem
 credentials.json
 service-account*.json
 *.key

@@ -12,6 +12,7 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -23,6 +24,8 @@ from core.trace import generate_trace_id, set_trace_id
 from schemas.response import ErrorCode, ErrorDetail, ErrorResponse
 
 logger = get_logger(__name__)
+
+background_tasks = set()
 
 
 # ─────────────────────────────────────────────
@@ -55,6 +58,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Background task: cleanup rate limiter + idempotency cache định kỳ
     cleanup_task = asyncio.create_task(_cleanup_background())
+    background_tasks.add(cleanup_task)
+    cleanup_task.add_done_callback(background_tasks.discard)
 
     logger.info(
         "✅ MeetWise Backend sẵn sàng phục vụ",
@@ -94,7 +99,7 @@ async def _cleanup_background() -> None:
     while True:
         await asyncio.sleep(60)  # Chạy mỗi 60 giây
         rate_limiter.cleanup()
-        idempotency_cache.cleanup_expired()
+        await idempotency_cache.cleanup_expired()
         logger.info(
             "Background cleanup hoàn thành",
             extra={"event": "background_cleanup"},
@@ -117,7 +122,6 @@ def create_app() -> FastAPI:
             "**Zero-Setup**: Chạy được ngay không cần API key hay config.\n"
             "**Frontend**: Đọc API contract tại `/docs` rồi gọi đúng endpoint."
         ),
-        version="2.0.0",
         # Swagger luôn bật — FE cần đọc contract
         docs_url="/docs",
         redoc_url="/redoc",
@@ -181,33 +185,38 @@ def create_app() -> FastAPI:
             ).model_dump(),
         )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(
+        request: Request,
+        exc: StarletteHTTPException,
+    ) -> JSONResponse:
+        """Xử lý HTTP errors (ví dụ 404, 405) theo chuẩn schema."""
+        trace_id = generate_trace_id()
+        set_trace_id(trace_id)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    code="HTTP_ERROR",
+                    message=str(exc.detail),
+                ),
+                trace_id=trace_id,
+            ).model_dump(),
+        )
+
     @app.exception_handler(Exception)
     async def general_exception_handler(
         request: Request,
         exc: Exception,
     ) -> JSONResponse:
-        """Catch-all handler — không expose stack trace."""
-        trace_id = generate_trace_id()
-        set_trace_id(trace_id)
+        import traceback
+        print("🔥 REAL ERROR:", exc)
+        print(traceback.format_exc())
 
-        logger.error(
-            "Unhandled exception",
-            extra={
-                "event": "unhandled_exception",
-                "error_type": type(exc).__name__,
-            },
-            exc_info=True,
-        )
-
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content=ErrorResponse(
-                error=ErrorDetail(
-                    code=ErrorCode.INTERNAL_ERROR,
-                    message="Lỗi hệ thống. Vui lòng thử lại sau.",
-                ),
-                trace_id=trace_id,
-            ).model_dump(),
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)  # trả lỗi thật ra ngoài
         )
 
     # ── Routes ───────────────────────────────
@@ -225,7 +234,6 @@ def create_app() -> FastAPI:
         return {
             "status": "healthy",
             "service": "meetwise-backend",
-            "version": "2.0.0",
             "environment": settings.app_env,
             "mode": {
                 "use_llm": settings.use_llm,

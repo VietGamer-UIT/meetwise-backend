@@ -148,7 +148,11 @@ class Z3Engine:
         }
 
         # 3. Tạo Solver với unsat_core support
-        solver = z3.Solver()
+        try:
+            solver = z3.Solver()
+            solver.set(unsat_core=True)
+        except Exception as e:
+            raise RuntimeError(f"Z3 lỗi: {e}")
 
         # 4. Assert giá trị từng variable từ facts
         #    Dùng assert_and_track để có thể extract unsat_core
@@ -207,7 +211,7 @@ class Z3Engine:
             # Extract unsat_core để biết điều kiện nào vi phạm
             unsat_core = solver.unsat_core()
             unsatisfied = self._extract_unsatisfied(
-                unsat_core, fact_labels, required_atoms
+                unsat_core, fact_labels, facts
             )
 
             explanation = (
@@ -234,7 +238,7 @@ class Z3Engine:
         self,
         unsat_core: Any,
         fact_labels: Dict[str, str],  # label_name → atom_name
-        all_atoms: List[str],
+        facts: Dict[str, bool],
     ) -> List[str]:
         """
         Phân tích unsat_core để tìm các biến gây ra conflict.
@@ -253,12 +257,13 @@ class Z3Engine:
                 unsatisfied.append(atom_name)
 
         # Nếu không extract được → trả về tất cả atoms có value False
-        if not unsatisfied and "condition_main" in core_names:
-            # Fallback: atoms nào có value False là suspicious
+        if not unsatisfied:
+            # Fallback:
             logger.warning(
                 "Không extract được unsatisfied từ core, dùng fallback",
                 extra={"event": "unsat_core_fallback"},
             )
+            unsatisfied = [k for k, v in facts.items() if v is False]
 
         return sorted(unsatisfied)  # Sort để deterministic
 

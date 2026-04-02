@@ -25,7 +25,14 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 
 import httpx
-_http_client = httpx.AsyncClient(timeout=5.0)
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=5.0)
+    return _http_client
 
 # Fixed suggested time cho mock mode (deterministic)
 _MOCK_SUGGESTED_TIME = "2026-04-01T10:00:00"
@@ -69,13 +76,17 @@ class GoogleChatClient:
             payload = {
                 "text": f"*{user}* — {message}"
             }
-            resp = await _http_client.post(
+            client = get_http_client()
+            resp = await client.post(
                 settings.google_chat_webhook_url,
                 json=payload,
             )
             resp.raise_for_status()
             logger.info(f"Chat gửi thành công tới {user}")
             return True
+        except httpx.HTTPError as exc:
+            logger.error(f"Chat webhook fail (HTTPError): {exc}", extra={"event": "chat_webhook_error"})
+            return False
         except Exception as exc:
             logger.error(f"Chat webhook fail: {exc}", extra={"event": "chat_webhook_error"})
             return False

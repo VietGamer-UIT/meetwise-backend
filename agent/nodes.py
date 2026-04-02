@@ -380,7 +380,7 @@ async def _call_llm_parse(rule: str) -> str:
     client = _get_llm_client()
     prompt = _PARSE_PROMPT_TEMPLATE.format(rule=rule)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     try:
         response = await loop.run_in_executor(
@@ -521,7 +521,7 @@ async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
         if not facts:
             raise ValueError("fetched_facts rỗng — fetch_facts chưa chạy thành công")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         verify_result = await loop.run_in_executor(None, lambda: z3_engine.verify(ast, facts))
 
         latency_ms = log_node_end(logger, step, start_time, success=True)
@@ -626,20 +626,12 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
         if settings.actions_enabled:
             try:
                 from services.action_service import execute_actions
-                action_results = await asyncio.wait_for(
-                    execute_actions(
-                        unsatisfied_conditions=unsatisfied,
-                        meeting_id=meeting_id,
-                        reason=reason,
-                    ),
-                    timeout=settings.action_timeout_seconds * len(unsatisfied) + 5,
+                action_results = await execute_actions(
+                    unsatisfied_conditions=unsatisfied,
+                    meeting_id=meeting_id,
+                    reason=reason,
                 )
                 executed_actions = [a.model_dump() for a in action_results]
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Action execution timeout — tiếp tục trả response",
-                    extra={"event": "actions_timeout", "meeting_id": meeting_id},
-                )
             except Exception as exc:
                 logger.error(
                     f"Action execution lỗi: {exc} — tiếp tục trả response",

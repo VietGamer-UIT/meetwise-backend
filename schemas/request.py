@@ -10,17 +10,23 @@ class EvaluateRequest(BaseModel):
     """
     Request body cho POST /v1/meetings/evaluate hackathon demo.
     """
-    slide_done: bool
-    sheet_done: bool
-    manager_free: bool
+    meeting_id: str = Field(..., description="Mã cuộc họp")
+    rule: str = Field(..., description="Luật kiểm duyệt ngôn ngữ tự nhiên")
+    override_facts: Optional[Dict[str, bool]] = Field(
+        default=None, description="Thông tin mock cho các variable"
+    )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "slide_done": False,
-                    "sheet_done": True,
-                    "manager_free": False,
+                    "meeting_id": "q1-kickoff-2024",
+                    "rule": "(Slide_Done OR Sheet_Done) AND Manager_Free",
+                    "override_facts": {
+                        "Slide_Done": False,
+                        "Sheet_Done": True,
+                        "Manager_Free": False
+                    }
                 }
             ]
         }

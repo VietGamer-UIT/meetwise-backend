@@ -147,12 +147,13 @@ class Z3Engine:
             name: z3.Bool(name) for name in required_atoms
         }
 
-        # 3. Tạo Solver với unsat_core support
+        # 3. Tạo Solver với unsat_core support và timeout
         try:
             solver = z3.Solver()
             solver.set(unsat_core=True)
+            solver.set("timeout", 3000)
         except Exception as e:
-            raise RuntimeError(f"Z3 lỗi: {e}")
+            raise RuntimeError(f"Z3 lỗi/Timeout config: {e}")
 
         # 4. Assert giá trị từng variable từ facts
         #    Dùng assert_and_track để có thể extract unsat_core

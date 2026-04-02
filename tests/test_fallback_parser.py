@@ -268,7 +268,7 @@ async def test_llm_quota_exceeded_uses_fallback():
                 json={
                     "meeting_id": "test-quota-001",
                     "rule": "Slide cập nhật hoặc Sheet chốt số. Bắt buộc Manager rảnh",
-                    "facts": {
+                    "override_facts": {
                         "Slide_Done": False,
                         "Sheet_Done": True,
                         "Manager_Free": False,
@@ -309,7 +309,7 @@ async def test_llm_timeout_uses_fallback():
                 json={
                     "meeting_id": "test-timeout-001",
                     "rule": "Slide done và Manager rảnh",
-                    "facts": {"Slide_Done": True, "Manager_Free": True},
+                    "override_facts": {"Slide_Done": True, "Manager_Free": True},
                 },
             )
 
@@ -341,7 +341,7 @@ async def test_llm_invalid_json_uses_fallback():
                 json={
                     "meeting_id": "test-invalid-json-001",
                     "rule": "Manager rảnh",
-                    "facts": {"Manager_Free": False},
+                    "override_facts": {"Manager_Free": False},
                 },
             )
 
@@ -373,7 +373,7 @@ async def test_use_llm_false_skips_llm_entirely():
                 json={
                     "meeting_id": "test-nollm-001",
                     "rule": "Slide hoặc Sheet. Bắt buộc Manager rảnh",
-                    "facts": {
+                    "override_facts": {
                         "Slide_Done": False,
                         "Sheet_Done": True,
                         "Manager_Free": False,
@@ -415,7 +415,7 @@ async def test_mandatory_spec_case_uses_fallback():
                 json={
                     "meeting_id": "test-spec-mandatory",
                     "rule": "Chỉ họp nếu Slide cập nhật hoặc Sheet chốt số. Bắt buộc Manager rảnh",
-                    "facts": {
+                    "override_facts": {
                         "Slide_Done": False,
                         "Sheet_Done": True,
                         "Manager_Free": False,

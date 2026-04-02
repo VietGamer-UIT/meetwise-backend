@@ -3,7 +3,7 @@ core/trace.py — Trace ID generation và propagation qua ContextVar
 """
 
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Optional
 
 
@@ -16,9 +16,9 @@ def generate_trace_id() -> str:
     return str(uuid.uuid4())
 
 
-def set_trace_id(trace_id: str) -> None:
-    """Gán trace_id vào context hiện tại."""
-    _trace_id_var.set(trace_id)
+def set_trace_id(trace_id: str) -> Token:
+    """Gán trace_id vào context hiện tại. Trả về token để phục hồi."""
+    return _trace_id_var.set(trace_id)
 
 
 def get_trace_id() -> str:
@@ -33,6 +33,6 @@ def get_trace_id() -> str:
     return trace_id
 
 
-def clear_trace_id() -> None:
-    """Reset trace_id (dùng sau khi request kết thúc)."""
-    _trace_id_var.set(None)
+def reset_trace_id(token: Token) -> None:
+    """Reset trace_id sử dụng context var token (an toàn)."""
+    _trace_id_var.reset(token)

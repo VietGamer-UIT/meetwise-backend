@@ -326,14 +326,37 @@ class Parser:
 
 
 def get_atoms(node: ConditionNode) -> List[str]:
-    """Thu thập tất cả tên biến (atoms) từ AST."""
-    if isinstance(node, AtomNode):
-        return [node.name]
-    elif isinstance(node, NotNode):
-        return get_atoms(node.operand)
-    elif isinstance(node, (AndNode, OrNode)):
-        return get_atoms(node.left) + get_atoms(node.right)
-    return []
+    """
+    Thu thập tất cả tên biến (atoms) từ AST, deduplicated.
+
+    Giữ nguyên thứ tự xuất hiện đầu tiên (first-occurrence order) —
+    quan trọng cho Z3 deterministic behavior và debug readability.
+
+    Tại sao cần dedup:
+      - Expression như "A and A" → get_atoms trả ["A", "A"]
+      - Z3 sẽ tạo 2 Bool("A") riêng biệt → assertion conflict
+      - dict.fromkeys() loại bỏ duplicate nhưng GIỮ NGUYÊN THỨ TỰ
+        (Python 3.7+ dict là ordered)
+      - sorted(set(...)) cũng dedup nhưng PHÁ VỠ thứ tự → không dùng
+
+    Args:
+        node: Root hoặc sub-node của condition AST.
+
+    Returns:
+        List[str]: Tên biến không trùng lặp, theo thứ tự xuất hiện đầu tiên.
+    """
+    def _collect(n: ConditionNode) -> List[str]:
+        """Đệ quy thu thập atoms (có thể trùng lặp)."""
+        if isinstance(n, AtomNode):
+            return [n.name]
+        elif isinstance(n, NotNode):
+            return _collect(n.operand)
+        elif isinstance(n, (AndNode, OrNode)):
+            return _collect(n.left) + _collect(n.right)
+        return []
+
+    # dict.fromkeys(): O(n), giữ thứ tự xuất hiện đầu tiên, loại trùng lặp
+    return list(dict.fromkeys(_collect(node)))
 
 
 # ─────────────────────────────────────────────

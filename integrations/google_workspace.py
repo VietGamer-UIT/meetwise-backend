@@ -1,5 +1,16 @@
 """
-integrations/google_workspace.py — Google Workspace Clients (v3 Zero-Setup)
+integrations/google_workspace.py — Google Workspace Clients (v4 Lazy-Init)
+
+Socket Exhaustion Fix (Lazy Singleton + asyncio.Lock):
+───────────────────────────────────────────────────────
+  Vấn đề cũ: _http_client được khởi tạo ở module-level (import time)
+  trước khi FastAPI event loop tồn tại → client gắn vào event loop sai
+  hoặc bị khởi tạo lại nhiều lần gây socket exhaustion.
+
+  Fix: get_http_client() khởi tạo lazily, được bảo vệ bởi asyncio.Lock
+  để đảm bảo chỉ tạo đúng một client trong event loop đang chạy.
+  close_http_client() được gọi trong shutdown lifespan để đảm bảo
+  tất cả connections được đóng sạch khi server dừng.
 
 ZERO-SETUP mode (USE_GOOGLE_SERVICES=false, default):
   - Tất cả calls đều là MOCK REALISTIC
@@ -26,13 +37,85 @@ logger = get_logger(__name__)
 
 import httpx
 
-_http_client: Optional[httpx.AsyncClient] = None
 
-def get_http_client() -> httpx.AsyncClient:
+# ─────────────────────────────────────────────
+# HTTP Client — Lazy Singleton (Socket-Safe)
+# ─────────────────────────────────────────────
+
+_http_client: Optional[httpx.AsyncClient] = None
+_http_client_lock: Optional[asyncio.Lock] = None
+
+
+def _get_lock() -> asyncio.Lock:
+    """
+    Lazy-init asyncio.Lock để tránh tạo lock trước khi event loop chạy.
+
+    asyncio.Lock phải được tạo trong event loop context.
+    """
+    global _http_client_lock
+    if _http_client_lock is None:
+        _http_client_lock = asyncio.Lock()
+    return _http_client_lock
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """
+    Lấy (hoặc khởi tạo) singleton AsyncClient.
+
+    Thread-safe với asyncio.Lock: chỉ tạo một client duy nhất dù
+    nhiều coroutines gọi đồng thời vào lần đầu (double-checked locking).
+
+    Client được gắn với event loop hiện tại — phải gọi từ bên trong
+    async context (event loop đang chạy).
+
+    Returns:
+        httpx.AsyncClient singleton, sẵn sàng sử dụng.
+    """
     global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=5.0)
+    # Fast path: client đã tồn tại (không cần lock)
+    if _http_client is not None and not _http_client.is_closed:
+        return _http_client
+
+    # Slow path: acquire lock và khởi tạo (double-checked)
+    async with _get_lock():
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=3.0,
+                    read=5.0,
+                    write=5.0,
+                    pool=5.0,
+                ),
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30.0,
+                ),
+            )
+            logger.info(
+                "httpx.AsyncClient khởi tạo (lazy singleton)",
+                extra={"event": "http_client_initialized"},
+            )
     return _http_client
+
+
+async def close_http_client() -> None:
+    """
+    Đóng AsyncClient và giải phóng tất cả connections.
+
+    Gọi trong FastAPI shutdown lifespan để tránh ResourceWarning
+    và đảm bảo graceful shutdown không để socket ở trạng thái
+    CLOSE_WAIT vô thời hạn.
+    """
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+        logger.info(
+            "httpx.AsyncClient đã đóng (graceful shutdown)",
+            extra={"event": "http_client_closed"},
+        )
+
 
 # Fixed suggested time cho mock mode (deterministic)
 _MOCK_SUGGESTED_TIME = "2026-04-01T10:00:00"
@@ -51,7 +134,7 @@ class GoogleChatClient:
       → Luôn trả True
 
     Real mode (USE_GOOGLE_SERVICES=true):
-      → POST tới webhook URL
+      → POST tới webhook URL qua shared AsyncClient
     """
 
     def _is_mock(self) -> bool:
@@ -67,16 +150,13 @@ class GoogleChatClient:
             )
             return True
 
-        # Real: POST tới webhook
         return await self._send_webhook(user, message)
 
     async def _send_webhook(self, user: str, message: str) -> bool:
         """Gửi POST tới Google Chat webhook."""
         try:
-            payload = {
-                "text": f"*{user}* — {message}"
-            }
-            client = get_http_client()
+            payload = {"text": f"*{user}* — {message}"}
+            client = await get_http_client()
             resp = await client.post(
                 settings.google_chat_webhook_url,
                 json=payload,
@@ -84,11 +164,23 @@ class GoogleChatClient:
             resp.raise_for_status()
             logger.info(f"Chat gửi thành công tới {user}")
             return True
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                f"Chat webhook fail (HTTP {exc.response.status_code}): {exc}",
+                extra={"event": "chat_webhook_error", "status_code": exc.response.status_code},
+            )
+            return False
         except httpx.HTTPError as exc:
-            logger.error(f"Chat webhook fail (HTTPError): {exc}", extra={"event": "chat_webhook_error"})
+            logger.error(
+                f"Chat webhook fail (HTTPError): {exc}",
+                extra={"event": "chat_webhook_error"},
+            )
             return False
         except Exception as exc:
-            logger.error(f"Chat webhook fail: {exc}", extra={"event": "chat_webhook_error"})
+            logger.error(
+                f"Chat webhook fail (unexpected): {exc}",
+                extra={"event": "chat_webhook_error"},
+            )
             return False
 
 
@@ -100,7 +192,7 @@ class GoogleCalendarClient:
     """
     Client tìm slot trống trong Google Calendar.
 
-    Mock mode: trả fixed datetime "2026-04-01T10:00:00"
+    Mock mode: trả fixed datetime "2026-04-01T10:00:00" (deterministic)
     Real mode: gọi Calendar FreeBusy API
     """
 
@@ -120,13 +212,12 @@ class GoogleCalendarClient:
         return await self._find_real_slot(meeting_id)
 
     async def _find_real_slot(self, meeting_id: str) -> str:
-        """Tìm slot thật (stub — implement khi deploy thật)."""
-        # Ngày làm việc tiếp theo lúc 10:00
+        """Tìm slot thật — ngày làm việc tiếp theo lúc 10:00 UTC."""
         now = datetime.now(timezone.utc)
         delta = 1
         while True:
             candidate = now + timedelta(days=delta)
-            if candidate.weekday() < 5:  # Mon-Fri
+            if candidate.weekday() < 5:  # Mon–Fri
                 return candidate.strftime("%Y-%m-%dT10:00:00")
             delta += 1
 
@@ -134,7 +225,8 @@ class GoogleCalendarClient:
         """
         Check Manager có rảnh không.
 
-        Mock: random True/False (simulate real-world)
+        Mock: random True/False (simulate real-world uncertainty)
+        Real: stub (implement với Calendar API khi deploy thật)
         """
         if self._is_mock():
             result = random.choice([True, False])
@@ -151,8 +243,8 @@ class GoogleDriveClient:
     """
     Client kiểm tra trạng thái Slide trên Google Drive.
 
-    Mock: random True/False
-    Real: kiểm tra modified time của file
+    Mock: random True/False (simulate real-world delay + uncertainty)
+    Real: kiểm tra modified time của file qua Drive API
     """
 
     def _is_mock(self) -> bool:
@@ -179,7 +271,7 @@ class GoogleSheetsClient:
     """
     Client kiểm tra trạng thái Sheet.
 
-    Mock: random True/False
+    Mock: random True/False (simulate real-world)
     Real: đọc status cell từ spreadsheet
     """
 

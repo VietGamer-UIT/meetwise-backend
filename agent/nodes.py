@@ -1,30 +1,24 @@
 """
-agent/nodes.py — LangGraph Node Functions (v3 — LLM-Resilient)
+agent/nodes.py — LangGraph Node Functions (v4 — Production-Hardened)
 
-                    ╔══════════════════════════════╗
-                    ║  LLM-RESILIENT ARCHITECTURE  ║
-                    ╠══════════════════════════════╣
-                    ║  LLM = OPTIONAL enhancement  ║
-                    ║  Fallback = MANDATORY path   ║
-                    ║  Pipeline NEVER dies on LLM  ║
-                    ╚══════════════════════════════╝
+                    ╔══════════════════════════════════╗
+                    ║  LLM-RESILIENT ARCHITECTURE v4   ║
+                    ╠══════════════════════════════════╣
+                    ║  LLM = OPTIONAL enhancement      ║
+                    ║  Fallback = MANDATORY path       ║
+                    ║  Pipeline NEVER dies on LLM      ║
+                    ║  Z3 runs in executor (blocking)  ║
+                    ╚══════════════════════════════════╝
 
-parse_input flow:
-    ┌─ USE_LLM=false ──────────────────────────────────────────────┐
-    │  → skip LLM entirely → fallback_parse_rule() → AST          │
-    └──────────────────────────────────────────────────────────────┘
-    ┌─ USE_LLM=true ───────────────────────────────────────────────┐
-    │  try:                                                        │
-    │    llm_result = call_llm()          # 1 attempt w/ retry    │
-    │    validate JSON (Pydantic)                                  │
-    │    parse AST                                                 │
-    │  except (429 | timeout | invalid JSON | any):               │
-    │    LOG warning (not error)                                   │
-    │    fallback_parse_rule()            # deterministic         │
-    └──────────────────────────────────────────────────────────────┘
-
-NEVER return LLM_UNAVAILABLE (503).
-ALWAYS return valid state with parsed_ast.
+Critical Fixes v4:
+  • asyncio.get_running_loop(): thay vì get_event_loop() (deprecated,
+    raises DeprecationWarning trong Python 3.10+, RuntimeError 3.12+).
+  • _background_tasks set: strong reference ngăn GC thu hồi tasks đang
+    chạy. Python 3.9+ GC có thể thu hồi Task nếu chỉ có weak ref.
+  • execute_actions KHÔNG bị bọc asyncio.wait_for: timeout kép sẽ giết
+    retry/backoff nội bộ của Tool. Tool layer tự manage timeout.
+  • Z3 solver local trong verify(): thread-safe, không chia sẻ state
+    giữa concurrent requests (mỗi verify() tạo solver riêng).
 """
 
 import asyncio
@@ -46,30 +40,40 @@ from solver.fallback_parser import fallback_parse_rule, fallback_to_logic_expres
 from solver.z3_engine import z3_engine
 
 logger = get_logger(__name__)
-_background_tasks = set()
+
+# Strong-reference set: giữ tasks sống đến khi done callback xóa chúng.
+# Nếu không có set này, Python 3.9+ GC có thể thu hồi Task bất cứ lúc nào
+# vì asyncio chỉ giữ weak reference đến pending tasks.
+_background_tasks: set = set()
 
 
 # ─────────────────────────────────────────────
-# LLM Response Validation (Pydantic)
+# LLM Response Schema (Pydantic Validated)
 # ─────────────────────────────────────────────
 
 class LLMParseResponse(BaseModel):
-    """Validate và parse JSON response từ LLM."""
+    """Validate và parse JSON response từ Gemini LLM."""
     logic_expression: str
     conditions: Optional[List[str]] = None
     reasoning: Optional[str] = None
 
     def validated_expression(self) -> str:
-        """Trả về logic_expression đã strip."""
+        """Trả về logic_expression đã strip whitespace."""
         return self.logic_expression.strip()
 
 
 # ─────────────────────────────────────────────
-# LLM Client
+# LLM Client (Lazy Init)
 # ─────────────────────────────────────────────
 
 def _get_llm_client():
-    """Lazy-init Gemini client — chỉ khởi tạo khi USE_LLM=true."""
+    """
+    Lazy-init Gemini client — chỉ khởi tạo khi USE_LLM=true.
+
+    Raises:
+        RuntimeError: Nếu GEMINI_API_KEY chưa được cấu hình hoặc
+                      thư viện google-generativeai chưa được cài.
+    """
     try:
         import google.genai as genai  # noqa: lazy import
         if not settings.gemini_api_key:
@@ -114,30 +118,42 @@ Chỉ trả về JSON, không có text nào khác.
 
 
 # ─────────────────────────────────────────────
-# Node: parse_input (v3 — LLM-Resilient)
+# Custom Exceptions (LLM-specific)
+# ─────────────────────────────────────────────
+
+class _QuotaExceededError(Exception):
+    """429 Resource Exhausted — dừng retry ngay lập tức."""
+
+
+class _InvalidResponseError(Exception):
+    """LLM trả về JSON không hợp lệ hoặc thiếu field bắt buộc."""
+
+
+# ─────────────────────────────────────────────
+# Node 1: parse_input (LLM-Resilient)
 # ─────────────────────────────────────────────
 
 async def parse_input_node(state: MeetingState) -> Dict[str, Any]:
     """
-    Node 1: Parse rule → logic expression → AST
+    Node 1: Parse rule → logic expression → AST.
 
-    v3 Architecture (LLM-RESILIENT):
-    1. Nếu USE_LLM=false → skip LLM, dùng fallback ngay
-    2. Nếu USE_LLM=true:
-       a. Thử LLM (với retry)
-       b. Validate JSON bằng Pydantic
-       c. Nếu bất kỳ lỗi nào → fallback (KHÔNG crash)
-    3. Parse fallback result thành AST
-    4. KHÔNG BAO GIỜ trả về error vì LLM
+    Flow (LLM-RESILIENT):
+    1. USE_LLM=false → skip LLM, dùng fallback ngay
+    2. USE_LLM=true:
+       a. Thử LLM (với retry + exponential backoff)
+       b. Validate JSON bằng Pydantic LLMParseResponse
+       c. Nếu bất kỳ lỗi nào → fallback (KHÔNG crash, KHÔNG trả 503)
+    3. Parse fallback/LLM result thành AST
+    4. Double-fallback nếu AST parse cũng fail
 
-    Chỉ trả lỗi nếu: fallback parser cũng fail hoàn toàn (rất hiếm)
+    KHÔNG BAO GIỜ trả về LLM_UNAVAILABLE trong node này.
     """
     step = "parse_input"
     start_time = log_node_start(logger, step, meeting_id=state.get("meeting_id"))
 
     rule = state.get("raw_rule", "")
     meeting_id = state.get("meeting_id", "")
-    parse_source = "unknown"  # "llm" | "fallback" | "skip_llm"
+    parse_source = "unknown"
 
     logic_expression: Optional[str] = None
 
@@ -163,9 +179,9 @@ async def parse_input_node(state: MeetingState) -> Dict[str, Any]:
         ast = parse(logic_expression)
         atoms = get_atoms(ast)
     except SyntaxError as exc:
-        # Logic expression vẫn invalid → thử fallback một lần nữa
+        # AST fail → double-fallback
         logger.warning(
-            f"AST parse fail trên '{logic_expression}': {exc} — thử fallback",
+            f"AST parse fail trên '{logic_expression}': {exc} — thử double-fallback",
             extra={"event": "ast_parse_fail_retry_fallback", "step": step},
         )
         try:
@@ -174,9 +190,9 @@ async def parse_input_node(state: MeetingState) -> Dict[str, Any]:
             atoms = get_atoms(ast)
             parse_source = "fallback_retry"
         except SyntaxError as exc2:
-            # Fallback cũng fail → dùng safe default "Manager_Free"
+            # Fallback cũng fail → safe default
             logger.error(
-                f"Cả LLM lẫn fallback đều fail ast parse: {exc2} — dùng Manager_Free",
+                f"Cả LLM lẫn fallback đều fail AST parse: {exc2} — dùng safe default",
                 extra={"event": "both_parsers_fail", "step": step},
             )
             logic_expression = "Manager_Free"
@@ -203,7 +219,7 @@ async def parse_input_node(state: MeetingState) -> Dict[str, Any]:
         "logic_expression": logic_expression,
         "parsed_ast": ast,
         "parsed_conditions": atoms,
-        "parse_source": parse_source,  # debug info
+        "parse_source": parse_source,
         "step_latencies": {
             **(state.get("step_latencies") or {}),
             step: latency_ms,
@@ -232,7 +248,6 @@ async def _try_llm_with_fallback(
     for attempt in range(1, settings.llm_max_retries + 1):
         try:
             logic_expression = await _call_llm_parse(rule)
-
             logger.info(
                 f"LLM parse thành công (attempt {attempt}): '{logic_expression[:80]}'",
                 extra={
@@ -249,50 +264,30 @@ async def _try_llm_with_fallback(
             last_error = f"LLM timeout sau {settings.step_timeout_seconds}s"
             logger.warning(
                 f"LLM timeout (attempt {attempt}/{settings.llm_max_retries})",
-                extra={
-                    "event": "llm_timeout",
-                    "step": step,
-                    "attempt": attempt,
-                    "meeting_id": meeting_id,
-                },
+                extra={"event": "llm_timeout", "step": step, "attempt": attempt, "meeting_id": meeting_id},
             )
 
         except _QuotaExceededError as exc:
-            # 429 Resource Exhausted → KHÔNG retry, chuyển fallback ngay
+            # 429 → KHÔNG retry, chuyển fallback ngay
             last_error = f"LLM quota exceeded (429): {exc}"
             logger.warning(
                 "LLM quota exceeded (429) — chuyển fallback ngay, không retry",
-                extra={
-                    "event": "llm_quota_exceeded",
-                    "step": step,
-                    "meeting_id": meeting_id,
-                },
+                extra={"event": "llm_quota_exceeded", "step": step, "meeting_id": meeting_id},
             )
-            break  # Dừng retry ngay
+            break
 
         except _InvalidResponseError as exc:
             last_error = f"LLM invalid JSON: {exc}"
             logger.warning(
                 f"LLM trả về JSON không hợp lệ (attempt {attempt}): {exc}",
-                extra={
-                    "event": "llm_invalid_response",
-                    "step": step,
-                    "attempt": attempt,
-                    "meeting_id": meeting_id,
-                },
+                extra={"event": "llm_invalid_response", "step": step, "attempt": attempt, "meeting_id": meeting_id},
             )
 
         except Exception as exc:
             last_error = str(exc)
             logger.warning(
                 f"LLM lỗi (attempt {attempt}/{settings.llm_max_retries}): {exc}",
-                extra={
-                    "event": "llm_error",
-                    "step": step,
-                    "attempt": attempt,
-                    "error": str(exc),
-                    "meeting_id": meeting_id,
-                },
+                extra={"event": "llm_error", "step": step, "attempt": attempt, "error": str(exc), "meeting_id": meeting_id},
             )
 
         if attempt < settings.llm_max_retries:
@@ -310,10 +305,9 @@ async def _try_llm_with_fallback(
         },
     )
 
-    # LLM_FALLBACK_ENABLED check (default True, không khuyến khích tắt)
     if not settings.llm_fallback_enabled:
         logger.error(
-            "LLM_FALLBACK_ENABLED=false và LLM fail → trả lỗi (behavior cũ)",
+            "LLM_FALLBACK_ENABLED=false và LLM fail → trả lỗi",
             extra={"event": "fallback_disabled_error"},
         )
         raise RuntimeError(f"LLM fail và fallback disabled: {last_error}")
@@ -325,7 +319,9 @@ async def _try_llm_with_fallback(
 def _run_fallback_parser(rule: str, reason: str) -> str:
     """
     Chạy deterministic fallback parser.
+
     NEVER raises — luôn trả về valid formula string.
+    Kể cả khi rule hoàn toàn invalid, vẫn trả "Manager_Free" (safe default).
     """
     logger.info(
         f"Fallback parser kích hoạt | reason={reason}",
@@ -352,34 +348,28 @@ def _run_fallback_parser(rule: str, reason: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Custom Exceptions (LLM-specific)
-# ─────────────────────────────────────────────
-
-class _QuotaExceededError(Exception):
-    """429 Resource Exhausted — stop retrying immediately."""
-
-
-class _InvalidResponseError(Exception):
-    """LLM trả về JSON không hợp lệ hoặc thiếu field."""
-
-
-# ─────────────────────────────────────────────
-# LLM Call (với structured error detection)
+# LLM Call (asyncio.get_running_loop() — Fixed)
 # ─────────────────────────────────────────────
 
 async def _call_llm_parse(rule: str) -> str:
     """
     Gọi Gemini LLM và extract logic expression.
 
+    Sử dụng asyncio.get_running_loop() thay vì get_event_loop():
+    - get_event_loop() deprecated trong Python 3.10+
+    - get_event_loop() raise RuntimeError trong Python 3.12+ nếu không có loop
+    - get_running_loop() luôn đúng khi gọi từ async context
+
     Raises:
-        _QuotaExceededError: Khi nhận 429
-        _InvalidResponseError: Khi JSON không hợp lệ
-        asyncio.TimeoutError: Khi timeout
-        Exception: Các lỗi khác
+        _QuotaExceededError: Khi nhận 429 Resource Exhausted
+        _InvalidResponseError: Khi JSON không hợp lệ hoặc thiếu field
+        asyncio.TimeoutError: Khi timeout (bắt ở caller)
+        Exception: Các lỗi khác từ Gemini API
     """
     client = _get_llm_client()
     prompt = _PARSE_PROMPT_TEMPLATE.format(rule=rule)
 
+    # get_running_loop() — đúng trong Python 3.7+ async context
     loop = asyncio.get_running_loop()
 
     try:
@@ -392,18 +382,18 @@ async def _call_llm_parse(rule: str) -> str:
         )
     except Exception as exc:
         exc_str = str(exc).lower()
-        # Detect 429 Resource Exhausted
         if "429" in exc_str or "resource_exhausted" in exc_str or "quota" in exc_str:
             raise _QuotaExceededError(f"Gemini API quota exceeded: {exc}") from exc
         raise
 
     raw_text = response.text.strip()
 
-    # Loại bỏ markdown code blocks nếu có
+    # Loại bỏ markdown code fences nếu model trả về ```json...```
     if raw_text.startswith("```"):
         lines = raw_text.split("\n")
-        # Skip first (```json) and last (```)
-        raw_text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        raw_text = "\n".join(
+            lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        )
     raw_text = raw_text.strip()
 
     # Parse và validate JSON bằng Pydantic
@@ -411,7 +401,7 @@ async def _call_llm_parse(rule: str) -> str:
         data = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         raise _InvalidResponseError(
-            f"JSON decode fail: {exc}\nRaw (first 200): {raw_text[:200]}"
+            f"JSON decode fail: {exc}\nRaw (first 200 chars): {raw_text[:200]}"
         ) from exc
 
     try:
@@ -429,7 +419,7 @@ async def _call_llm_parse(rule: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Node: fetch_facts
+# Node 2: fetch_facts
 # ─────────────────────────────────────────────
 
 async def fetch_facts_node(state: MeetingState) -> Dict[str, Any]:
@@ -437,7 +427,7 @@ async def fetch_facts_node(state: MeetingState) -> Dict[str, Any]:
     Node 2: Lấy facts từ tools (song song) hoặc dùng override từ request.
 
     Nếu raw_facts được cung cấp trong state → dùng trực tiếp (không gọi tools).
-    Nếu không có → gọi tools song song qua FirestoreClient.
+    Nếu không có → gọi tools song song qua fetch_facts_parallel().
     """
     step = "fetch_facts"
     start_time = log_node_start(logger, step, meeting_id=state.get("meeting_id"))
@@ -455,6 +445,7 @@ async def fetch_facts_node(state: MeetingState) -> Dict[str, Any]:
                 extra={"event": "facts_override", "step": step, "facts": raw_facts},
             )
             fetched_facts = dict(raw_facts)
+            # Điền False cho các atoms chưa có trong override
             for condition in parsed_conditions:
                 if condition not in fetched_facts:
                     fetched_facts[condition] = False
@@ -499,12 +490,18 @@ async def fetch_facts_node(state: MeetingState) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
-# Node: verify_logic
+# Node 3: verify_logic (Thread-Safe Z3)
 # ─────────────────────────────────────────────
 
 async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
     """
     Node 3: Chạy Z3 solver để kiểm tra facts có thỏa mãn conditions không.
+
+    Z3 là thư viện C++ binding — blocking. Chạy trong executor để không
+    block event loop. Mỗi lần gọi verify() tạo z3.Solver() mới (stateless)
+    nên hoàn toàn thread-safe với concurrent requests.
+
+    Sử dụng asyncio.get_running_loop() (không phải get_event_loop()).
     """
     step = "verify_logic"
     start_time = log_node_start(logger, step, meeting_id=state.get("meeting_id"))
@@ -521,8 +518,14 @@ async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
         if not facts:
             raise ValueError("fetched_facts rỗng — fetch_facts chưa chạy thành công")
 
+        # get_running_loop() là cách đúng trong Python 3.10+
         loop = asyncio.get_running_loop()
-        verify_result = await loop.run_in_executor(None, lambda: z3_engine.verify(ast, facts))
+
+        # Z3 solver chạy trong thread pool — không block event loop
+        verify_result = await loop.run_in_executor(
+            None,
+            lambda: z3_engine.verify(ast, facts),
+        )
 
         latency_ms = log_node_end(logger, step, start_time, success=True)
         metrics.record_node(step, latency_ms)
@@ -545,7 +548,10 @@ async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
     except RuntimeError as exc:
         latency_ms = log_node_end(logger, step, start_time, success=False)
         metrics.record_node(step, latency_ms, error=True)
-        logger.error(f"Z3 engine lỗi: {exc}", extra={"event": "z3_error", "step": step})
+        logger.error(
+            f"Z3 engine lỗi: {exc}",
+            extra={"event": "z3_error", "step": step},
+        )
         return {
             "error_code": ErrorCode.INTERNAL_ERROR,
             "error_message": "Lỗi hệ thống khi kiểm tra logic điều kiện.",
@@ -572,14 +578,22 @@ async def verify_logic_node(state: MeetingState) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
-# Node: decide_action (v2 — with Action Execution)
+# Node 4: decide_action (GC-Safe Background Tasks)
 # ─────────────────────────────────────────────
 
 async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
     """
     Node 4: Quyết định READY hoặc RESCHEDULED dựa vào Z3 result.
 
-    v2: RESCHEDULED → execute_actions() song song
+    Firestore writes: fire-and-forget background tasks được lưu trong
+    _background_tasks set (module-level) để giữ strong reference.
+    Python 3.9+ chỉ giữ weak ref đến tasks — nếu không có strong ref,
+    GC có thể thu hồi task đang chạy giữa chừng mà không có cảnh báo.
+
+    execute_actions: KHÔNG bị bọc asyncio.wait_for ở đây.
+    Tool layer (@async_tool decorator) đã có timeout và retry nội bộ.
+    Bọc wait_for bên ngoài sẽ cancel toàn bộ retry chain khi timeout,
+    dẫn đến mất tất cả actions dù retry thứ 2 có thể thành công.
     """
     step = "decide_action"
     start_time = log_node_start(logger, step, meeting_id=state.get("meeting_id"))
@@ -600,17 +614,22 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
     meeting_id = state.get("meeting_id", "")
 
     if verify_result.satisfied:
-        status = MeetingStatus.READY.value
+        # ── READY ─────────────────────────────────────────────────
+        decision_status = MeetingStatus.READY.value
         reason = "Tất cả điều kiện đã được thỏa mãn. Cuộc họp có thể diễn ra đúng lịch."
         unsatisfied: List[str] = []
         executed_actions: List[Dict[str, Any]] = []
 
-        task = asyncio.create_task(_update_firestore_status(meeting_id, "Ready"))
+        # Fire-and-forget Firestore write (strong reference via set)
+        task = asyncio.create_task(
+            _update_firestore_status(meeting_id, "Ready")
+        )
         _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        task.add_done_callback(_background_tasks.discard)  # cleanup khi done
 
     else:
-        status = MeetingStatus.RESCHEDULED.value
+        # ── RESCHEDULED ───────────────────────────────────────────
+        decision_status = MeetingStatus.RESCHEDULED.value
         unsatisfied = verify_result.unsatisfied_conditions or []
 
         if unsatisfied:
@@ -626,6 +645,8 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
         if settings.actions_enabled:
             try:
                 from services.action_service import execute_actions
+                # KHÔNG wrap asyncio.wait_for — Tool layer tự manage timeout.
+                # Bọc wait_for sẽ cancel retry chain khi timeout.
                 action_results = await execute_actions(
                     unsatisfied_conditions=unsatisfied,
                     meeting_id=meeting_id,
@@ -638,26 +659,34 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
                     extra={"event": "actions_error", "meeting_id": meeting_id},
                 )
 
+        # Default actions nếu không có (actions disabled hoặc tất cả fail)
         if not executed_actions:
             executed_actions = [
                 {
                     "type": "NOTIFY",
                     "target": "Manager",
                     "status": "sent",
-                    "message": f"Cuộc họp không thể diễn ra. Thiếu: {', '.join(unsatisfied)}"
+                    "message": (
+                        f"Cuộc họp không thể diễn ra. "
+                        f"Thiếu: {', '.join(unsatisfied)}"
+                    ),
                 },
                 {
                     "type": "RESCHEDULE",
                     "target": None,
                     "status": "sent",
-                    "proposed_time": "2026-04-01T10:00:00"
-                }
+                    "proposed_time": "2026-04-01T10:00:00",
+                },
             ]
 
-        task2 = asyncio.create_task(_update_firestore_status(
-            meeting_id, "Unsat",
-            result={"status": status, "reason": reason, "unsatisfied": unsatisfied}
-        ))
+        # Fire-and-forget Firestore write
+        task2 = asyncio.create_task(
+            _update_firestore_status(
+                meeting_id,
+                "Unsat",
+                result={"status": decision_status, "reason": reason, "unsatisfied": unsatisfied},
+            )
+        )
         _background_tasks.add(task2)
         task2.add_done_callback(_background_tasks.discard)
 
@@ -665,18 +694,18 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
     metrics.record_node(step, latency_ms)
 
     logger.info(
-        f"Quyết định: {status} | Actions: {len(executed_actions)}",
+        f"Quyết định: {decision_status} | Actions: {len(executed_actions)}",
         extra={
             "event": "decision_made",
             "step": step,
-            "status": status,
+            "status": decision_status,
             "unsatisfied": unsatisfied,
             "action_count": len(executed_actions),
         },
     )
 
     return {
-        "final_status": status,
+        "final_status": decision_status,
         "final_reason": reason,
         "unsatisfied_conditions": unsatisfied,
         "executed_actions": executed_actions,
@@ -688,7 +717,7 @@ async def decide_action_node(state: MeetingState) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
-# Helper: Firestore Status Update (fire-and-forget)
+# Helper: Firestore Status Update (Fire-and-Forget)
 # ─────────────────────────────────────────────
 
 async def _update_firestore_status(
@@ -696,7 +725,11 @@ async def _update_firestore_status(
     status: str,
     result: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Fire-and-forget: không raise nếu fail."""
+    """
+    Fire-and-forget Firestore status update.
+
+    Không raise bất cứ exception nào — lỗi Firestore là non-critical.
+    """
     try:
         from storage.firestore_client import firestore_client, MeetingStateStatus
         fs_status = MeetingStateStatus(status)

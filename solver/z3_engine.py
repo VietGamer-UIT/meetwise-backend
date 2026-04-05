@@ -1,18 +1,33 @@
 """
-solver/z3_engine.py — Z3 SMT Solver Engine
+solver/z3_engine.py — Z3 SMT Solver Engine (v4 Thread-Safe + Timeout)
 
-Chức năng:
-- Chuyển đổi AST → Z3 formulas
-- assert_and_track() để lấy unsat_core chính xác
-- Trả về {satisfied, unsatisfied_conditions}
+Thread-Safety Architecture:
+────────────────────────────
+  SỐNG CÒN: z3.Solver() KHÔNG thread-safe. Nếu dùng như class attribute
+  hoặc singleton bên trong solver, concurrent requests sẽ chia sẻ
+  trạng thái → state bleed → kết quả sai, crash, hoặc undefined behavior.
 
-Quy tắc:
-- Z3 fail → raise RuntimeError → caller trả về INTERNAL_ERROR (500)
-- Unsat core → danh sách điều kiện chưa thỏa mãn chính xác
+  Fix: verify() tạo z3.Solver() CỤC BỘ mỗi lần gọi. Stateless hoàn toàn.
+  Mỗi request có solver riêng, không bao giờ chia sẻ.
+
+Timeout Defense:
+────────────────
+  solver.set("timeout", 3000): 3 giây hard limit cho Z3 solver.
+  Ngăn chặn ReDoS-style vòng lặp vô hạn trên complex formulas.
+  Nếu Z3 trả về z3.unknown → raise RuntimeError để caller xử lý.
+
+Empty Unsat Core Fallback:
+───────────────────────────
+  Z3 có thể tối ưu hoá quá mức và trả về UNSAT với empty unsat_core().
+  Trong trường hợp này: Smart Fallback — duyệt qua facts và gắn cờ
+  tất cả điều kiện có value False là "thủ phạm".
+
+Kết hợp verify_logic_node + run_in_executor:
+  Mỗi request gọi verify() trong ThreadPoolExecutor → hoàn toàn concurrency-safe.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 import z3
 
@@ -35,7 +50,14 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class VerifyResult:
-    """Kết quả từ Z3 verification."""
+    """
+    Kết quả không thay đổi sau mỗi Z3 verification.
+
+    Attributes:
+        satisfied:               True nếu tất cả điều kiện thỏa mãn.
+        unsatisfied_conditions:  Danh sách biến gây ra conflict (sorted).
+        explanation:             Mô tả kết quả bằng tiếng Việt.
+    """
     satisfied: bool
     unsatisfied_conditions: List[str]
     explanation: str
@@ -53,14 +75,14 @@ def _ast_to_z3(
     Đệ quy chuyển đổi AST node thành Z3 formula.
 
     Args:
-        node: AST node
-        z3_vars: mapping tên biến → Z3 Bool variable
+        node:    AST node (AtomNode, AndNode, OrNode, NotNode).
+        z3_vars: Mapping tên biến → Z3 Bool variable.
 
     Returns:
-        Z3 BoolRef formula
+        Z3 BoolRef formula.
 
     Raises:
-        RuntimeError: Nếu gặp node type không hỗ trợ
+        RuntimeError: Nếu gặp biến chưa có trong facts hoặc node type không hỗ trợ.
     """
     if isinstance(node, AtomNode):
         var = z3_vars.get(node.name)
@@ -90,19 +112,27 @@ def _ast_to_z3(
 
 
 # ─────────────────────────────────────────────
-# Z3 Engine
+# Z3 Engine (Stateless — Thread-Safe)
 # ─────────────────────────────────────────────
 
 class Z3Engine:
     """
     Z3 SMT Solver Engine cho Meeting Readiness Evaluation.
 
-    Quy trình:
-    1. Tạo Z3 Bool variables từ facts
-    2. Assert giá trị từng variable theo facts
-    3. Assert condition formula
-    4. Check satisfiability
-    5. Nếu UNSAT → extract unsat_core để biết điều kiện nào fail
+    THIẾT KẾ STATELESS:
+    Không có instance state nào.
+    z3.Solver() được tạo CỤC BỘ trong mỗi lần gọi verify() →
+    hoàn toàn thread-safe cho concurrent requests.
+
+    Quy trình verify():
+    1. Lấy tất cả atoms từ AST (deduplicated, order-preserved)
+    2. Tạo Z3 Bool variables (local, không chia sẻ)
+    3. Tạo local z3.Solver() với timeout 3000ms
+    4. assert_and_track() từng fact để có unsat_core chính xác
+    5. Assert điều kiện chính
+    6. Check → SAT / UNSAT / UNKNOWN
+    7. UNSAT → extract unsatisfied conditions từ core
+       → Empty core → Smart Fallback (False facts)
     """
 
     def verify(
@@ -113,18 +143,21 @@ class Z3Engine:
         """
         Kiểm tra xem tập facts có thỏa mãn condition AST không.
 
+        Method này được gọi từ asyncio.run_in_executor(), có thể chạy
+        đồng thời bởi nhiều thread. Hoàn toàn stateless — an toàn.
+
         Args:
-            ast: Root node của condition AST
-            facts: Dict mapping variable_name → bool value
+            ast:   Root node của condition AST.
+            facts: Dict mapping variable_name → bool value.
 
         Returns:
-            VerifyResult với satisfied=True/False và unsat_core
+            VerifyResult (frozen dataclass, immutable).
 
         Raises:
-            RuntimeError: Nếu Z3 gặp lỗi internal
+            RuntimeError: Nếu Z3 gặp lỗi internal hoặc UNKNOWN result.
         """
         try:
-            return self._do_verify(ast, facts)
+            return self._do_verify(ast, dict(facts))  # Tạo bản copy để tránh mutation
         except RuntimeError:
             raise
         except Exception as exc:
@@ -137,43 +170,39 @@ class Z3Engine:
         ast: ConditionNode,
         facts: Dict[str, bool],
     ) -> VerifyResult:
-        """Internal verification logic."""
+        """Internal: thực hiện verification với local solver."""
 
-        # 1. Lấy tất cả atoms cần thiết từ AST
-        required_atoms = list(set(get_atoms(ast)))
+        # 1. Lấy atoms từ AST (deduplicated nhưng giữ nguyên thứ tự xuất hiện đầu tiên)
+        required_atoms = get_atoms(ast)  # get_atoms đã được fixed với dict.fromkeys()
 
-        # 2. Tạo Z3 variables cho mỗi atom
+        # 2. Tạo Z3 Bool variables (local — KHÔNG shared state)
         z3_vars: Dict[str, z3.BoolRef] = {
             name: z3.Bool(name) for name in required_atoms
         }
 
-        # 3. Tạo Solver với unsat_core support và timeout
-        try:
-            solver = z3.Solver()
-            solver.set(unsat_core=True)
-            solver.set("timeout", 3000)
-        except Exception as e:
-            raise RuntimeError(f"Z3 lỗi/Timeout config: {e}")
+        # 3. Tạo Solver CỤC BỘ với unsat_core support và timeout 3000ms.
+        #    CRITICAL: z3.Solver() PHẢI được tạo ở đây, không phải ở class level.
+        #    Nếu tạo ở class level → shared state giữa threads → state bleed.
+        solver = z3.Solver()
+        solver.set(unsat_core=True)
+        solver.set("timeout", 3000)  # 3 giây — ngăn ReDoS / vòng lặp vô hạn
 
-        # 4. Assert giá trị từng variable từ facts
-        #    Dùng assert_and_track để có thể extract unsat_core
-        fact_labels: Dict[str, z3.BoolRef] = {}
+        # 4. Assert giá trị từng variable với assert_and_track()
+        #    Label cho phép extract chính xác biến nào gây ra conflict.
+        fact_labels: Dict[str, str] = {}  # label_name → atom_name
+
         for atom_name in required_atoms:
             if atom_name not in facts:
-                # Biến chưa có fact → mặc định False
+                # Biến chưa có fact → mặc định False (pessimistic)
                 logger.warning(
                     f"Biến '{atom_name}' không có trong facts → mặc định False",
-                    extra={
-                        "event": "missing_fact",
-                        "variable": atom_name,
-                    },
+                    extra={"event": "missing_fact", "variable": atom_name},
                 )
-                facts = {**facts, atom_name: False}
+                facts[atom_name] = False
 
             z3_var = z3_vars[atom_name]
             fact_value = facts[atom_name]
 
-            # Label để track trong unsat_core
             label_name = f"fact_{atom_name}"
             label = z3.Bool(label_name)
             fact_labels[label_name] = atom_name
@@ -183,12 +212,12 @@ class Z3Engine:
             else:
                 solver.assert_and_track(z3.Not(z3_var), label)
 
-        # 5. Assert điều kiện chính cần thỏa mãn
+        # 5. Assert điều kiện chính
         condition_formula = _ast_to_z3(ast, z3_vars)
         condition_label = z3.Bool("condition_main")
         solver.assert_and_track(condition_formula, condition_label)
 
-        # 6. Check
+        # 6. Check satisfiability
         result = solver.check()
 
         logger.info(
@@ -196,7 +225,6 @@ class Z3Engine:
             extra={
                 "event": "z3_check",
                 "result": str(result),
-                "facts": facts,
                 "required_atoms": required_atoms,
             },
         )
@@ -209,10 +237,11 @@ class Z3Engine:
             )
 
         elif result == z3.unsat:
-            # Extract unsat_core để biết điều kiện nào vi phạm
             unsat_core = solver.unsat_core()
             unsatisfied = self._extract_unsatisfied(
-                unsat_core, fact_labels, facts
+                unsat_core=unsat_core,
+                fact_labels=fact_labels,
+                facts=facts,
             )
 
             explanation = (
@@ -229,10 +258,10 @@ class Z3Engine:
             )
 
         else:
-            # z3.unknown — không xác định được
+            # z3.unknown — timeout hoặc solver bị overwhelmed
             raise RuntimeError(
-                "Z3 không thể xác định kết quả (unknown). "
-                "Vui lòng kiểm tra lại điều kiện."
+                "Z3 không thể xác định kết quả (unknown/timeout). "
+                "Có thể do formula quá phức tạp hoặc timeout 3000ms bị vượt quá."
             )
 
     def _extract_unsatisfied(
@@ -244,30 +273,49 @@ class Z3Engine:
         """
         Phân tích unsat_core để tìm các biến gây ra conflict.
 
-        Logic:
-        - Nếu condition_main có trong core → check từng fact label
-        - Tìm các fact label trong core → đó là biến gây fail
+        Smart Fallback cho Empty Unsat Core:
+        Z3 có thể tối ưu formula và trả về unsat_core rỗng khi:
+        - Formula bị short-circuit
+        - Solver quyết định bằng unit propagation không cần tracking
+
+        Trong trường hợp đó: duyệt qua facts và gắn cờ tất cả điều kiện
+        có value False là thủ phạm (conservative/safe fallback).
+
+        Args:
+            unsat_core: z3 unsat core expression list.
+            fact_labels: Mapping từ Z3 label name → atom name.
+            facts:       Dict fact values (để fallback).
+
+        Returns:
+            Sorted list of unsatisfied atom names.
         """
         unsatisfied = []
-
         core_names = {str(label) for label in unsat_core}
 
-        # Kiểm tra từng fact label xem có trong core không
+        # Primary: extract từ unsat_core labels
         for label_name, atom_name in fact_labels.items():
             if label_name in core_names:
                 unsatisfied.append(atom_name)
 
-        # Nếu không extract được → trả về tất cả atoms có value False
+        # Smart Fallback: unsat_core rỗng (Z3 over-optimization)
         if not unsatisfied:
-            # Fallback:
             logger.warning(
-                "Không extract được unsatisfied từ core, dùng fallback",
-                extra={"event": "unsat_core_fallback"},
+                "Unsat core rỗng (Z3 over-optimization) — dùng Smart Fallback: "
+                "flag all False facts as unsatisfied",
+                extra={"event": "unsat_core_empty_fallback"},
             )
-            unsatisfied = [k for k, v in facts.items() if v is False]
+            # Chỉ flag các facts thuộc required atoms (không phải toàn bộ facts dict)
+            unsatisfied = [
+                atom_name
+                for label_name, atom_name in fact_labels.items()
+                if facts.get(atom_name) is False
+            ]
 
-        return sorted(unsatisfied)  # Sort để deterministic
+        return sorted(unsatisfied)  # Sort để deterministic output
 
 
-# Singleton
+# ─────────────────────────────────────────────
+# Singleton (stateless engine — safe to share)
+# ─────────────────────────────────────────────
+
 z3_engine = Z3Engine()

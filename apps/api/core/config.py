@@ -1,10 +1,14 @@
 """
-core/config.py — Cấu hình toàn cục (v4 — Zero-Setup)
+core/config.py — Cấu hình toàn cục (v5 — Enterprise SaaS)
 
 Triết lý:
 - Mọi external service đều MẶC ĐỊNH = OFF
 - Chạy được ngay không cần config gì
 - Bật dần lên khi cần tích hợp thật
+
+V5 bổ sung:
+- Supabase (PostgreSQL + Auth) cho Phase 2 CRUD
+- Resend (Email) cho notification service
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,7 +56,7 @@ class Settings(BaseSettings):
     step_timeout_seconds: float = 5.0
 
     # === LLM Retry ===
-    llm_max_retries: int = 2  # Giảm xuống 2 để fail-fast hơn
+    llm_max_retries: int = 2
     llm_retry_delay_seconds: float = 0.5
 
     # === Idempotency Cache ===
@@ -72,6 +76,33 @@ class Settings(BaseSettings):
     action_timeout_seconds: float = 5.0
     actions_enabled: bool = True
 
+    # ─────────────────────────────────────────────────────────
+    # SUPABASE — Database & Auth (Phase 2)
+    # ─────────────────────────────────────────────────────────
+
+    supabase_url: str = ""
+    """URL Supabase project. Ví dụ: https://xxxx.supabase.co"""
+
+    supabase_anon_key: str = ""
+    """Anon key (public) — dùng ở frontend. Backend dùng service_role_key."""
+
+    supabase_service_role_key: str = ""
+    """Service role key (secret) — bypass RLS, chỉ dùng ở backend server."""
+
+    supabase_jwt_secret: str = ""
+    """JWT secret để verify Supabase access tokens.
+    Lấy từ Supabase Dashboard → Settings → API → JWT Secret."""
+
+    # ─────────────────────────────────────────────────────────
+    # RESEND — Email Service (Phase 2)
+    # ─────────────────────────────────────────────────────────
+
+    resend_api_key: str = ""
+    """Resend API key. Lấy từ resend.com → API Keys."""
+
+    resend_from_email: str = "noreply@meetwise.app"
+    """Email người gửi mặc định."""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -89,6 +120,11 @@ class Settings(BaseSettings):
         if self.cors_allowed_origins.strip() == "*":
             return ["*"]
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
+    @property
+    def supabase_configured(self) -> bool:
+        """Kiểm tra Supabase đã được cấu hình chưa."""
+        return bool(self.supabase_url and self.supabase_service_role_key)
 
 
 @lru_cache(maxsize=1)

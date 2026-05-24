@@ -1,4 +1,4 @@
-﻿"""
+"""
 main.py — FastAPI Application Entry Point
 
 MeetWise Backend: Meeting Readiness Evaluation Engine
@@ -24,6 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.v1.meetings import router as meetings_router
+from api.v1.auth import router as auth_router
+from api.v1.users import router as users_router
+from api.v1.meeting_crud import router as meeting_crud_router
+from api.v1.dashboard import router as dashboard_router
+from api.v1.notifications import router as notifications_router
 from core.config import settings
 from core.logging import get_logger
 from core.metrics import metrics
@@ -148,20 +153,26 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="MeetWise API",
+        version="2.0.0",
         description=(
-            "## Meeting Readiness Evaluation Engine\n\n"
-            "Backend service đánh giá sự sẵn sàng của cuộc họp "
-            "sử dụng kiến trúc Neuro-Symbolic (LLM optional + Z3 Solver + LangGraph).\n\n"
-            "**Zero-Setup**: Chạy được ngay không cần API key hay config.\n"
-            "**Frontend**: Đọc API contract tại `/docs` rồi gọi đúng endpoint."
+            "## MeetWise — AI Meeting Readiness Platform\n\n"
+            "Nền tảng SaaS đánh giá sự sẵn sàng cuộc họp bằng kiến trúc **Neuro-Symbolic** "
+            "(LangGraph + Z3 SMT Solver + Gemini LLM).\n\n"
+            "### Tính năng chính\n"
+            "- 🔐 **Auth**: Đăng ký / Đăng nhập qua Supabase Auth\n"
+            "- 📅 **Cuộc họp**: CRUD đầy đủ + trigger AI đánh giá\n"
+            "- 🤖 **AI Engine**: Pipeline LangGraph 4 bước (parse → fetch → verify → decide)\n"
+            "- 📊 **Dashboard**: Thống kê sẵn sàng cuộc họp\n"
+            "- 🔔 **Thông báo**: Real-time notifications\n\n"
+            "**Built by**: Đoàn Hoàng Việt (Việt Gamer)"
         ),
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
         lifespan=lifespan,
         contact={
-            "name": "MeetWise Team",
-            "email": "thuhuyen19082005@gmail.com",
+            "name": "Đoàn Hoàng Việt (Việt Gamer)",
+            "url": "https://github.com/VietGamer",
         },
         license_info={"name": "MIT"},
     )
@@ -263,7 +274,15 @@ def create_app() -> FastAPI:
             reset_trace_id(token)
 
     # ── Routes ───────────────────────────────
+    # AI Evaluation Engine (core — V1 compatible)
     app.include_router(meetings_router)
+
+    # Phase 2: SaaS Endpoints
+    app.include_router(auth_router)
+    app.include_router(users_router)
+    app.include_router(meeting_crud_router)
+    app.include_router(dashboard_router)
+    app.include_router(notifications_router)
 
     # ── Health Check ─────────────────────────
     @app.get(
@@ -281,6 +300,7 @@ def create_app() -> FastAPI:
                 "use_llm": settings.use_llm,
                 "use_firebase": settings.use_firebase,
                 "use_google_services": settings.use_google_services,
+                "supabase_configured": settings.supabase_configured,
             },
             "metrics": metrics.get_summary(),
         }

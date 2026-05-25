@@ -2,9 +2,8 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { thongBaoApi } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
-import { Bell, BellOff, CheckCheck, Trash2 } from "lucide-react";
+import { BellOff, CheckCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import Link from "next/link";
 
 const typeIcon: Record<string, string> = {
   meeting_ready: "✅",

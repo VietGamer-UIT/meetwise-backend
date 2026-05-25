@@ -20,7 +20,7 @@ export default function CuocHopPage() {
 
   const danhGiaMutation = useMutation({
     mutationFn: (id: string) => cuocHopApi.danhGia(id),
-    onSuccess: (_, id) => {
+    onSuccess: () => {
       toast.success("AI đang đánh giá cuộc họp...");
       qc.invalidateQueries({ queryKey: ["cuoc-hop"] });
       qc.invalidateQueries({ queryKey: ["dashboard-stats"] });

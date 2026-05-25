@@ -13,7 +13,7 @@ const schema = z.object({
   title: z.string().min(1, "Tiêu đề không được để trống").max(200),
   description: z.string().max(2000).optional(),
   scheduled_at: z.string().min(1, "Vui lòng chọn ngày giờ"),
-  duration_minutes: z.coerce.number().min(5).max(480),
+  duration_minutes: z.number().min(5).max(480),
   location: z.string().max(500).optional(),
   meeting_url: z.string().url("URL không hợp lệ").optional().or(z.literal("")),
   rule: z.string().min(1, "Điều kiện họp không được để trống").max(2000),
@@ -32,7 +32,7 @@ export default function TaoMoiCuocHopPage() {
   const qc = useQueryClient();
 
   const {
-    register, handleSubmit, setValue, watch,
+    register, handleSubmit, setValue,
     formState: { errors, isSubmitting },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
@@ -67,7 +67,7 @@ export default function TaoMoiCuocHopPage() {
         </Link>
         <h1 className="text-2xl font-bold text-slate-100">Tạo cuộc họp mới</h1>
         <p className="text-slate-400 text-sm mt-1">
-          AI sẽ đánh giá điều kiện khi bạn nhấn "Đánh giá".
+          AI sẽ đánh giá điều kiện khi bạn nhấn &quot;Đánh giá&quot;.
         </p>
       </div>
 
@@ -124,7 +124,7 @@ export default function TaoMoiCuocHopPage() {
               </label>
               <input
                 type="number"
-                {...register("duration_minutes")}
+                {...register("duration_minutes", { valueAsNumber: true })}
                 className="input"
                 placeholder="60"
               />

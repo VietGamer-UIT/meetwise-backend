@@ -1,7 +1,7 @@
 "use client";
 import { useQuery } from "@tanstack/react-query";
-import { dashboardApi, cuocHopApi } from "@/lib/api";
-import { formatDate, getMeetingStatusColor, getMeetingStatusLabel } from "@/lib/utils";
+import { dashboardApi } from "@/lib/api";
+import { formatDate } from "@/lib/utils";
 import {
   CalendarDays, CheckCircle2, XCircle, Clock,
   TrendingUp, Plus, ChevronRight, Zap,

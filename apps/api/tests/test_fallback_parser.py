@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_fallback_parser.py — Tests cho Deterministic Fallback Parser
 
 Bao gồm:
@@ -258,7 +258,7 @@ async def test_llm_quota_exceeded_uses_fallback():
     # Mock: simulate 429 quota exceeded
     quota_error = Exception("429 RESOURCE_EXHAUSTED: Quota exceeded")
 
-    with patch("agent.nodes._call_llm_parse", side_effect=quota_error):
+    with patch("ai_engine.agent.nodes._call_llm_parse", side_effect=quota_error):
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
@@ -297,7 +297,7 @@ async def test_llm_timeout_uses_fallback():
     from main import app
 
     with patch(
-        "agent.nodes._call_llm_parse",
+        "ai_engine.agent.nodes._call_llm_parse",
         side_effect=asyncio.TimeoutError("Simulated LLM timeout"),
     ):
         async with AsyncClient(
@@ -329,7 +329,7 @@ async def test_llm_invalid_json_uses_fallback():
     from main import app
 
     with patch(
-        "agent.nodes._call_llm_parse",
+        "ai_engine.agent.nodes._call_llm_parse",
         side_effect=ValueError("JSON decode fail: Expecting value"),
     ):
         async with AsyncClient(
@@ -363,7 +363,7 @@ async def test_use_llm_false_skips_llm_entirely():
         return "(Slide_Done or Sheet_Done) and Manager_Free"
 
     with patch("core.config.settings.use_llm", False), \
-         patch("agent.nodes._call_llm_parse", new=AsyncMock(side_effect=counting_mock)):
+         patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(side_effect=counting_mock)):
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
@@ -403,7 +403,7 @@ async def test_mandatory_spec_case_uses_fallback():
 
     # Kill LLM hoàn toàn
     with patch(
-        "agent.nodes._call_llm_parse",
+        "ai_engine.agent.nodes._call_llm_parse",
         side_effect=Exception("429 RESOURCE_EXHAUSTED: Quota = 0"),
     ):
         async with AsyncClient(

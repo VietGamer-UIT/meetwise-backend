@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_api.py — Integration tests cho API endpoints (v2)
 
 v2: Bổ sung tests cho:
@@ -152,7 +152,7 @@ async def test_mandatory_test_case_rescheduled(client: AsyncClient):
     """
     logic_expr = "(Slide_Done or Sheet_Done) and Manager_Free"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -190,7 +190,7 @@ async def test_rescheduled_actions_executed(client: AsyncClient):
     """
     logic_expr = "(Slide_Done or Sheet_Done) and Manager_Free"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -237,7 +237,7 @@ async def test_confirmed_no_actions(client: AsyncClient):
     """Khi READY → actions list phải rỗng."""
     logic_expr = "(Slide_Done or Sheet_Done) and Manager_Free"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -262,7 +262,7 @@ async def test_confirmed_when_all_satisfied(client: AsyncClient):
     """Tất cả điều kiện đều True → READY."""
     logic_expr = "(Slide_Done or Sheet_Done) and Manager_Free"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -287,7 +287,7 @@ async def test_response_has_trace_id(client: AsyncClient):
     """Response luôn có trace_id."""
     logic_expr = "Slide_Done"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -308,7 +308,7 @@ async def test_custom_trace_id_in_header(client: AsyncClient):
     custom_trace = "my-custom-trace-123"
     logic_expr = "Slide_Done"
 
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)):
         response = await client.post(
             "/v1/meetings/evaluate",
             headers={"X-Request-ID": custom_trace},
@@ -335,7 +335,7 @@ async def test_bad_request_parser_error(client: AsyncClient):
 
     Expected: 200 (pipeline vẫn chạy được qua fallback, không phải 400).
     """
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value="and Slide_Done")):
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value="and Slide_Done")):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -364,7 +364,7 @@ async def test_error_response_no_stack_trace(client: AsyncClient):
 
     Verify chính: response text KHÔNG chứa Python stack trace.
     """
-    with patch("agent.nodes._call_llm_parse", side_effect=Exception("Internal error")):
+    with patch("ai_engine.agent.nodes._call_llm_parse", side_effect=Exception("Internal error")):
         response = await client.post(
             "/v1/meetings/evaluate",
             json={
@@ -390,7 +390,7 @@ async def test_action_fail_does_not_fail_api(client: AsyncClient):
     logic_expr = "Manager_Free"
 
     # Mock action service để raise exception
-    with patch("agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)), \
+    with patch("ai_engine.agent.nodes._call_llm_parse", new=AsyncMock(return_value=logic_expr)), \
          patch("services.action_service.execute_actions", side_effect=Exception("Chat API down")):
         response = await client.post(
             "/v1/meetings/evaluate",

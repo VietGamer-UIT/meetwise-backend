@@ -23,7 +23,7 @@ from main import app
 # Dữ liệu giả (mock data)
 # ─────────────────────────────────────────────────────────────
 
-FAKE_USER_ID = "user-test-" + str(uuid.uuid4())[:8]
+FAKE_USER_ID = str(uuid.uuid4())
 FAKE_USER = {
     "id": FAKE_USER_ID,
     "email": "test@meetwise.app",
@@ -45,13 +45,15 @@ FAKE_MEETING = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "updated_at": datetime.now(timezone.utc).isoformat(),
     "last_evaluated_at": None,
+    "team_id": str(uuid.uuid4()),
 }
 
 FAKE_MEETING_LIST = {
     "items": [FAKE_MEETING],
     "total": 1,
-    "trang": 1,
-    "kich_thuoc": 20,
+    "page": 1,
+    "page_size": 20,
+    "has_next": False,
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -103,19 +105,32 @@ async def client():
 # Helper: patch auth + supabase đồng thời
 # ─────────────────────────────────────────────────────────────
 
+from fastapi import Request
+
+class MockAuthContext:
+    def __enter__(self):
+        from middleware.auth_middleware import require_auth
+        async def fake_auth(request: Request):
+            request.state.user_id = FAKE_USER_ID
+            request.state.user_email = FAKE_USER["email"]
+            request.state.user_role = "authenticated"
+        app.dependency_overrides[require_auth] = fake_auth
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        from middleware.auth_middleware import require_auth
+        app.dependency_overrides.pop(require_auth, None)
+
 def mock_auth():
     """Context manager mock auth_middleware để inject user giả."""
-    return patch(
-        "middleware.auth_middleware.get_current_user",
-        return_value=FAKE_USER,
-    )
+    return MockAuthContext()
 
 
 def mock_supabase(meeting_data=None):
     """Context manager mock Supabase client."""
     mock, chain = _make_supabase_mock(meeting_data=meeting_data)
     return patch(
-        "integrations.supabase_client.get_supabase_client",
+        "integrations.supabase_client.get_supabase",
         return_value=mock,
     ), mock, chain
 
@@ -146,8 +161,8 @@ async def test_tao_cuoc_hop_thanh_cong(client: AsyncClient):
     chain.insert.return_value.select.return_value.single.return_value = chain
 
     with mock_auth(), \
-         patch("integrations.supabase_client.get_supabase_client", return_value=supabase_mock), \
-         patch("services.meeting_crud_service.MeetingCrudService.tao_moi", new_callable=AsyncMock, return_value=FAKE_MEETING):
+         patch("integrations.supabase_client.get_supabase", return_value=supabase_mock), \
+         patch("services.meeting_crud_service.MeetingCRUDService.create", new_callable=AsyncMock, return_value=FAKE_MEETING):
 
         response = await client.post("/v1/cuoc-hop", json=payload)
 
@@ -206,7 +221,7 @@ async def test_lay_danh_sach_cuoc_hop(client: AsyncClient):
     Expected: 200 + danh sách cuộc họp + metadata phân trang.
     """
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.danh_sach", new_callable=AsyncMock, return_value=FAKE_MEETING_LIST):
+         patch("services.meeting_crud_service.MeetingCRUDService.list_meetings", new_callable=AsyncMock, return_value=FAKE_MEETING_LIST):
 
         response = await client.get("/v1/cuoc-hop")
 
@@ -232,7 +247,7 @@ async def test_lay_danh_sach_co_filter_trang_thai(client: AsyncClient):
     }
 
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.danh_sach", new_callable=AsyncMock, return_value=filtered_list):
+         patch("services.meeting_crud_service.MeetingCRUDService.list_meetings", new_callable=AsyncMock, return_value=filtered_list):
 
         response = await client.get("/v1/cuoc-hop?trang_thai=pending")
 
@@ -249,7 +264,7 @@ async def test_lay_danh_sach_phan_trang(client: AsyncClient):
     Expected: 200, kich_thuoc <= 5.
     """
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.danh_sach", new_callable=AsyncMock, return_value=FAKE_MEETING_LIST):
+         patch("services.meeting_crud_service.MeetingCRUDService.list_meetings", new_callable=AsyncMock, return_value=FAKE_MEETING_LIST):
 
         response = await client.get("/v1/cuoc-hop?trang=1&kich_thuoc=5")
 
@@ -269,7 +284,7 @@ async def test_lay_chi_tiet_cuoc_hop(client: AsyncClient):
     Expected: 200 + đầy đủ thông tin cuộc họp.
     """
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.chi_tiet", new_callable=AsyncMock, return_value=FAKE_MEETING):
+         patch("services.meeting_crud_service.MeetingCRUDService.get_by_id", new_callable=AsyncMock, return_value=FAKE_MEETING):
 
         response = await client.get(f"/v1/cuoc-hop/{FAKE_MEETING_ID}")
 
@@ -289,7 +304,7 @@ async def test_lay_chi_tiet_khong_ton_tai(client: AsyncClient):
     from fastapi import HTTPException
 
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.chi_tiet", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy cuộc họp")):
+         patch("services.meeting_crud_service.MeetingCRUDService.get_by_id", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy cuộc họp")):
 
         response = await client.get(f"/v1/cuoc-hop/{uuid.uuid4()}")
 
@@ -318,8 +333,8 @@ async def test_kich_hoat_danh_gia_ai(client: AsyncClient):
     }
 
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.chi_tiet", new_callable=AsyncMock, return_value=FAKE_MEETING), \
-         patch("services.meeting_crud_service.MeetingCrudService.danh_gia", new_callable=AsyncMock, return_value=fake_result):
+         patch("services.meeting_crud_service.MeetingCRUDService.get_by_id", new_callable=AsyncMock, return_value=FAKE_MEETING), \
+         patch("services.meeting_crud_service.MeetingCRUDService.trigger_ai_evaluation", new_callable=AsyncMock, return_value=fake_result):
 
         response = await client.post(f"/v1/cuoc-hop/{FAKE_MEETING_ID}/danh-gia")
 
@@ -358,8 +373,8 @@ async def test_xoa_cuoc_hop_thanh_cong(client: AsyncClient):
     Expected: 200 hoặc 204.
     """
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.chi_tiet", new_callable=AsyncMock, return_value=FAKE_MEETING), \
-         patch("services.meeting_crud_service.MeetingCrudService.xoa", new_callable=AsyncMock, return_value={"message": "Đã xóa thành công"}):
+         patch("services.meeting_crud_service.MeetingCRUDService.get_by_id", new_callable=AsyncMock, return_value=FAKE_MEETING), \
+         patch("services.meeting_crud_service.MeetingCRUDService.delete", new_callable=AsyncMock, return_value={"message": "Đã xóa thành công"}):
 
         response = await client.delete(f"/v1/cuoc-hop/{FAKE_MEETING_ID}")
 
@@ -374,8 +389,8 @@ async def test_xoa_cuoc_hop_khong_ton_tai(client: AsyncClient):
     from fastapi import HTTPException
 
     with mock_auth(), \
-         patch("services.meeting_crud_service.MeetingCrudService.chi_tiet", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy")), \
-         patch("services.meeting_crud_service.MeetingCrudService.xoa", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy")):
+         patch("services.meeting_crud_service.MeetingCRUDService.get_by_id", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy")), \
+         patch("services.meeting_crud_service.MeetingCRUDService.delete", new_callable=AsyncMock, side_effect=HTTPException(status_code=404, detail="Không tìm thấy")):
 
         response = await client.delete(f"/v1/cuoc-hop/{uuid.uuid4()}")
 
